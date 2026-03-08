@@ -1,0 +1,416 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
+
+import cv2
+import numpy as np
+import pandas as pd
+import random
+from datetime import datetime
+from sklearn.impute import KNNImputer
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+import timm
+from pydicom import dcmread
+import logging
+
+SEED = 7226
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+
+# Update column names to match your CSV exactly
+BIOMARKER_COLS = ['AGE', 'Height', 'Weight', 'waist', 'BMI',
+                  'SBP', 'DBP', 'gluc', 'HbA1c', 'Creatinin',
+                  'BUN', 't-chol', 'TG', 'Uric Acid', 'Albumin', 'eGFR']
+
+
+# ── Image Preprocessing (CLAHE → bilateral → gamma, paper §Methods) ──────────
+def preprocess_fundus(img: np.ndarray) -> np.ndarray:
+    lab = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+    lab[:, :, 0] = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(lab[:, :, 0])
+    img = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+    img = cv2.bilateralFilter(img, 9, 75, 75)
+    lut = np.array([(i / 255.0) ** (1.0 / 0.9) * 255 for i in range(256)], dtype=np.uint8)
+    return cv2.LUT(img, lut)
+
+
+# ── KNN Imputation: fit on train split only ───────────────────────────────────
+def knn_impute_train_only(df: pd.DataFrame, n_neighbors: int = 5) -> pd.DataFrame:
+    df = df.copy()
+    valid_cols = [c for c in df.select_dtypes(include=[np.number]).columns
+                  if not df[c].isna().all()]
+    imputer = KNNImputer(n_neighbors=n_neighbors)
+    imputer.fit(df.loc[df['split'] == 'train', valid_cols])
+    df[valid_cols] = imputer.transform(df[valid_cols])
+    return df
+
+
+def split_by_patient_group(df: pd.DataFrame,
+                            train_frac=0.7, val_frac=0.1) -> pd.DataFrame:
+    np.random.seed(SEED)
+    uids = df['subid'].unique()
+    np.random.shuffle(uids)
+    n_tr = int(train_frac * len(uids))
+    n_va = int(val_frac   * len(uids))
+    tr_ids = set(uids[:n_tr])
+    va_ids = set(uids[n_tr:n_tr + n_va])
+    df['split'] = df['subid'].apply(
+        lambda s: 'train' if s in tr_ids else ('val' if s in va_ids else 'test'))
+    return df
+
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+class FundusSingleTaskDataset(Dataset):
+    def __init__(self, df, root_dir, split, transform,
+                 target_col, t_mean=0.0, t_std=1.0):
+        self.samples   = []
+        self.transform = transform
+        self.t_mean    = t_mean
+        self.t_std     = t_std
+
+        for _, row in df[df['split'] == split].iterrows():
+            target = row[target_col]
+            if pd.isna(target):
+                continue
+            try:
+                date = datetime.strptime(str(row['ODT']), '%m/%d/%Y').strftime('%Y%m%d')
+            except Exception:
+                try:
+                    date = datetime.strptime(str(row['ODT']), '%Y-%m-%d').strftime('%Y%m%d')
+                except:
+                    continue
+            folder = f"{row['subid']}_{date}_{row['SEX']}_{int(row['AGE'])}"
+            fp = os.path.join(root_dir, folder)
+            if not os.path.isdir(fp):
+                continue
+            files = sorted([f for f in os.listdir(fp) if f.endswith('.dcm')])
+            if len(files) != 2:
+                continue
+            for f in files:
+                self.samples.append((os.path.join(fp, f), float(target)))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, target = self.samples[idx]
+        if not os.path.isfile(path):
+            return None
+        img = dcmread(path).pixel_array.astype(float)
+        if img.max() > 255 or img.min() < 0:
+            img = (img - img.min()) / (img.max() - img.min() + 1e-8) * 255
+        img = img.astype(np.uint8)
+        if img.ndim == 2:
+            img = np.stack([img] * 3, axis=-1)
+        elif img.shape[-1] == 1:
+            img = np.repeat(img, 3, axis=-1)
+        img = preprocess_fundus(img)
+        if self.transform:
+            img = self.transform(img)
+        target_norm = (target - self.t_mean) / (self.t_std + 1e-8)
+        return img, torch.tensor([target_norm], dtype=torch.float32)
+
+
+def clean_collate_fn(batch):
+    batch = [b for b in batch if b is not None]
+    if not batch:
+        return None
+    imgs, tgts = zip(*batch)
+    return torch.stack(imgs), torch.stack(tgts)
+
+
+train_transform = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.RandomHorizontalFlip(p=0.3),  # paper: only this augmentation
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
+val_transform = transforms.Compose([
+    transforms.ToPILImage(),
+    transforms.Resize(256),
+    transforms.CenterCrop(224),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
+
+
+# ── Model Modules ─────────────────────────────────────────────────────────────
+class HigherOrderFeatureExtractor(nn.Module):
+    def __init__(self, backbone):
+        super().__init__()
+        self.backbone = backbone
+
+    def forward(self, x):
+        feats = self.backbone(x)
+        maps  = feats[-3:] if isinstance(feats, (list, tuple)) and len(feats) >= 3 else [feats]
+        out   = []
+        for fm in maps:
+            n, c, h, w = fm.size()
+            gap      = fm.mean(dim=(2, 3))
+            gmp      = fm.view(n, c, -1).max(dim=2)[0]
+            fm_flat  = fm.view(n, c, h * w)
+            cov_diag = (fm_flat - fm_flat.mean(dim=2, keepdim=True)).pow(2).mean(dim=2)
+            out.extend([gap, gmp, cov_diag])
+        return torch.cat(out, dim=1)
+
+
+class PolynomialExpansion(nn.Module):
+    """Eq. 2: concatenate [x, x²]."""
+    def forward(self, x):
+        return torch.cat([x, x.pow(2)], dim=1)
+
+
+class FeatureSelectionMask(nn.Module):
+    """Eq. 3: x_masked = x ⊙ diag(W_mask) — learnable per-biomarker feature gate."""
+    def __init__(self, dim: int):
+        super().__init__()
+        self.w = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        return x * self.w
+
+    def l1_penalty(self):
+        return self.w.abs().sum()
+
+
+class F2BNetSingle(nn.Module):
+    """
+    Single-task F2B-Net for one biomarker.
+    Shared backbone → compression → poly branch + masked residual branch → sum.
+    """
+    def __init__(self, backbone_name='mobilevit_s',
+                 bottleneck_dim=64, l1_lambda=1e-4):
+        super().__init__()
+        backbone = timm.create_model(backbone_name, pretrained=True, features_only=True)
+        self.extractor = HigherOrderFeatureExtractor(backbone)
+
+        with torch.no_grad():
+            feat_dim = self.extractor(torch.randn(1, 3, 224, 224)).shape[1]
+
+        self.compression = nn.Sequential(
+            nn.Linear(feat_dim, bottleneck_dim),
+            nn.BatchNorm1d(bottleneck_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+        )
+        self.poly = PolynomialExpansion()
+
+        self.poly_head = nn.Sequential(
+            nn.BatchNorm1d(bottleneck_dim * 2),
+            nn.Linear(bottleneck_dim * 2, 32),
+            nn.ReLU(),
+            nn.BatchNorm1d(32),
+            nn.Dropout(0.15),
+            nn.Linear(32, 1),
+        )
+        self.feature_mask  = FeatureSelectionMask(bottleneck_dim)
+        self.residual_head = nn.Sequential(
+            nn.Linear(bottleneck_dim, 32),
+            nn.ReLU(),
+            nn.BatchNorm1d(32),
+            nn.Dropout(0.15),
+            nn.Linear(32, 1),
+        )
+        self.l1_lambda = l1_lambda
+
+    def forward(self, x):
+        c = self.compression(self.extractor(x))
+        return self.poly_head(self.poly(c)) + self.residual_head(self.feature_mask(c))
+
+    def reg_loss(self):
+        return self.l1_lambda * (
+            self.feature_mask.l1_penalty() +
+            self.compression[0].weight.abs().sum()
+        )
+
+
+# ── Training function for one biomarker ──────────────────────────────────────
+def train_one_biomarker(target_col: str, df, root_dir,
+                        t_mean: float, t_std: float,
+                        num_epochs=100, patience=10) -> tuple:
+
+    logging.info(f"\n{'='*60}\n  Training: {target_col}  "
+                 f"(mean={t_mean:.3f}, std={t_std:.3f})\n{'='*60}")
+
+    train_ds = FundusSingleTaskDataset(df, root_dir, 'train', train_transform,
+                                       target_col, t_mean, t_std)
+    val_ds   = FundusSingleTaskDataset(df, root_dir, 'val',   val_transform,
+                                       target_col, t_mean, t_std)
+    test_ds  = FundusSingleTaskDataset(df, root_dir, 'test',  val_transform,
+                                       target_col, t_mean, t_std)
+
+    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True,
+                              num_workers=4, pin_memory=True,
+                              collate_fn=clean_collate_fn)
+    val_loader   = DataLoader(val_ds,   batch_size=64, shuffle=False,
+                              num_workers=4, pin_memory=True,
+                              collate_fn=clean_collate_fn)
+    test_loader  = DataLoader(test_ds,  batch_size=64, shuffle=False,
+                              num_workers=4, pin_memory=True,
+                              collate_fn=clean_collate_fn)
+
+    model = F2BNetSingle(bottleneck_dim=64, l1_lambda=1e-4).to(device)
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
+
+    # 5-epoch linear warmup → cosine annealing (prevents epoch-6-style spikes)
+    warmup_sched = LinearLR(optimizer, start_factor=0.1, end_factor=1.0, total_iters=5)
+    cosine_sched = CosineAnnealingLR(optimizer, T_max=num_epochs - 5, eta_min=1e-6)
+    scheduler    = SequentialLR(optimizer, [warmup_sched, cosine_sched], milestones=[5])
+
+    criterion        = nn.MSELoss()
+    best_val_mae     = float('inf')
+    patience_counter = 0
+    best_epoch       = 0
+    save_path        = f'best_{target_col}_F2BNet.pth'
+
+    def get_reg(m):
+        return m.module.reg_loss() if isinstance(m, nn.DataParallel) else m.reg_loss()
+
+    for epoch in range(num_epochs):
+        # ── Train ──
+        model.train()
+        tr_mae_sum = tr_batches = 0
+        for batch in train_loader:
+            if batch is None:
+                continue
+            imgs, tgts = batch
+            imgs = imgs.to(device, non_blocking=True)
+            tgts = tgts.to(device, non_blocking=True)
+
+            optimizer.zero_grad()
+            preds = model(imgs)
+            loss  = criterion(preds, tgts) + get_reg(model)
+
+            # NaN guard: skip corrupted batch without poisoning BN stats
+            if not torch.isfinite(loss):
+                logging.warning(f"  [{target_col}] Non-finite loss at epoch "
+                                f"{epoch+1}, skipping batch")
+                optimizer.zero_grad()
+                continue
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            optimizer.step()
+
+            p_orig = preds.detach() * t_std + t_mean
+            t_orig = tgts.detach()  * t_std + t_mean
+            tr_mae_sum += (p_orig - t_orig).abs().mean().item()
+            tr_batches += 1
+
+        # ── Validate ──
+        model.eval()
+        val_mae_sum = val_rmse_sum = val_batches = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                if batch is None:
+                    continue
+                imgs, tgts = batch
+                imgs  = imgs.to(device, non_blocking=True)
+                tgts  = tgts.to(device, non_blocking=True)
+                preds = model(imgs)
+                p_orig = preds * t_std + t_mean
+                t_orig = tgts  * t_std + t_mean
+                val_mae_sum  += (p_orig - t_orig).abs().mean().item()
+                val_rmse_sum += ((p_orig - t_orig)**2).mean().sqrt().item()
+                val_batches  += 1
+
+        scheduler.step()
+
+        avg_tr_mae   = tr_mae_sum   / max(tr_batches,  1)
+        avg_val_mae  = val_mae_sum  / max(val_batches, 1)
+        avg_val_rmse = val_rmse_sum / max(val_batches, 1)
+
+        # Hard NaN stop (BN stats already corrupted — no point continuing)
+        if not np.isfinite(avg_val_mae):
+            logging.warning(f"  [{target_col}] NaN val MAE at epoch {epoch+1}, "
+                            f"loading best and stopping.")
+            break
+
+        logging.info(f"  [{target_col}] Epoch {epoch+1:3d} | "
+                     f"Train MAE: {avg_tr_mae:.4f} | "
+                     f"Val MAE: {avg_val_mae:.4f} | "
+                     f"Val RMSE: {avg_val_rmse:.4f}")
+
+        if avg_val_mae < best_val_mae:
+            best_val_mae = avg_val_mae
+            best_epoch   = epoch + 1
+            patience_counter = 0
+            torch.save(model.state_dict(), save_path)
+            logging.info(f"  [{target_col}] ★ NEW BEST  Val MAE: {best_val_mae:.4f}")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                logging.info(f"  [{target_col}] Early stopping at epoch {epoch+1}. "
+                             f"Best: epoch {best_epoch}")
+                break
+
+    # ── Test ──
+    model.load_state_dict(torch.load(save_path))
+    model.eval()
+    test_mae_sum = test_rmse_sum = test_batches = 0
+    with torch.no_grad():
+        for batch in test_loader:
+            if batch is None:
+                continue
+            imgs, tgts = batch
+            imgs  = imgs.to(device, non_blocking=True)
+            tgts  = tgts.to(device, non_blocking=True)
+            preds = model(imgs)
+            p_orig = preds * t_std + t_mean
+            t_orig = tgts  * t_std + t_mean
+            test_mae_sum  += (p_orig - t_orig).abs().mean().item()
+            test_rmse_sum += ((p_orig - t_orig)**2).mean().sqrt().item()
+            test_batches  += 1
+
+    test_mae  = test_mae_sum  / max(test_batches, 1)
+    test_rmse = test_rmse_sum / max(test_batches, 1)
+    logging.info(f"  [{target_col}] ✓ Test MAE: {test_mae:.4f} | "
+                 f"Test RMSE: {test_rmse:.4f}")
+    return test_mae, test_rmse
+
+
+# ── Data Setup ────────────────────────────────────────────────────────────────
+csv_file = 'Excel/SKKU_OCT20240625_eye_expanded.csv'
+root_dir = 'Excel/New_Data_Set'
+
+df = pd.read_csv(csv_file, encoding='ISO-8859-1')
+for col in BIOMARKER_COLS:
+    df[col] = pd.to_numeric(df[col], errors='coerce')
+
+df       = split_by_patient_group(df)          # split before imputation
+df       = knn_impute_train_only(df)           # fit only on train
+train_df = df[df['split'] == 'train']
+
+logging.info(f"Splits → train:{(df['split']=='train').sum()} "
+             f"val:{(df['split']=='val').sum()} "
+             f"test:{(df['split']=='test').sum()}")
+
+# ── Train one model per biomarker ─────────────────────────────────────────────
+results = {}
+for col in BIOMARKER_COLS:
+    t_mean = float(train_df[col].mean())
+    t_std  = float(train_df[col].std())
+    mae, rmse = train_one_biomarker(col, df, root_dir, t_mean, t_std)
+    results[col] = {'MAE': mae, 'RMSE': rmse}
+
+# ── Final Summary Table ───────────────────────────────────────────────────────
+print(f'\n{"="*50}')
+print('FINAL TEST RESULTS — Single Model per Biomarker')
+print(f'{"Biomarker":<20} {"MAE":>10} {"RMSE":>10}')
+print('-' * 42)
+for col in BIOMARKER_COLS:
+    print(f'{col:<20} {results[col]["MAE"]:>10.4f} {results[col]["RMSE"]:>10.4f}')
+print('-' * 42)
+mean_mae  = np.mean([v['MAE']  for v in results.values()])
+mean_rmse = np.mean([v['RMSE'] for v in results.values()])
+print(f'{"Mean":<20} {mean_mae:>10.4f} {mean_rmse:>10.4f}')
