@@ -23,10 +23,19 @@ random.seed(SEED)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
+
+
+
 # Update column names to match your CSV exactly
 BIOMARKER_COLS = ['AGE', 'Height', 'Weight', 'waist', 'BMI',
                   'SBP', 'DBP', 'gluc', 'HbA1c', 'Creatinin',
                   'BUN', 't-chol', 'TG', 'Uric Acid', 'Albumin', 'eGFR']
+
+# Per-biomarker overrides — only biomarkers that need non-default settings
+# Default: patience=10, loss=MSE, bottleneck=64
+BIOMARKER_OVERRIDES = {
+    't-chol': {'patience': 15},   # interrupted in first run — needs full convergence
+}
 
 
 # ── Image Preprocessing (CLAHE → bilateral → gamma, paper §Methods) ──────────
@@ -235,6 +244,10 @@ class F2BNetSingle(nn.Module):
 def train_one_biomarker(target_col: str, df, root_dir,
                         t_mean: float, t_std: float,
                         num_epochs=100, patience=10) -> tuple:
+    # ── Apply per-biomarker override if defined ───────────────────────────────
+    overrides = BIOMARKER_OVERRIDES.get(target_col, {})
+    patience  = overrides.get('patience', patience)
+    # (extendable: add 'loss', 'bottleneck' overrides here in future if needed)
 
     logging.info(f"\n{'='*60}\n  Training: {target_col}  "
                  f"(mean={t_mean:.3f}, std={t_std:.3f})\n{'='*60}")
@@ -414,3 +427,4 @@ print('-' * 42)
 mean_mae  = np.mean([v['MAE']  for v in results.values()])
 mean_rmse = np.mean([v['RMSE'] for v in results.values()])
 print(f'{"Mean":<20} {mean_mae:>10.4f} {mean_rmse:>10.4f}')
+
