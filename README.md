@@ -9,7 +9,7 @@ Gluc - [gluc]                    ✓ Test MAE: 10.4327 | Test RMSE: 15.2807
 HbA1c -  [HbA1c]                 ✓ Test MAE: 0.3433 | Test RMSE: 0.5446
 Creatinine - [Creatinin]         ✓ Test MAE: 0.1189 | Test RMSE: 0.1586
 BUN -  [BUN]                     ✓ Test MAE: 2.7080 | Test RMSE: 3.5097
-T-chol - [T-chol]                ✓ Test MAE: 28.9580 | Test RMSE: 36.4717
+T-chol - [T-chol]                ✓ Test MAE: 28.580 | Test RMSE: 36.0747
 TG -     [TG]                    ✓ Test MAE: 52.3276 | Test RMSE: 75.1090
 Uric Acid [Uric Acid]            ✓ Test MAE: 0.9789 | Test RMSE: 1.2398
 Albumin                          ✓ Test MAE: 0.2072 | Test RMSE: 0.2642
